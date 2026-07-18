@@ -20,6 +20,7 @@ from urllib.request import Request, urlopen
 
 COMPUTE_API = "https://compute.api.cloud.yandex.net/compute/v1/instances"
 IAM_API = "https://iam.api.cloud.yandex.net/iam/v1/tokens"
+METADATA_TOKEN_API = "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token"
 STOP = False
 
 
@@ -28,6 +29,7 @@ class Settings:
     instance_id: str
     iam_token: str | None
     oauth_token: str | None
+    use_metadata_token: bool
     interval_seconds: int
     timeout_seconds: int
 
@@ -47,14 +49,16 @@ def read_settings() -> Settings:
     instance_id = os.getenv("YC_INSTANCE_ID", "").strip()
     iam_token = os.getenv("YC_IAM_TOKEN", "").strip() or None
     oauth_token = os.getenv("YC_OAUTH_TOKEN", "").strip() or None
+    use_metadata_token = os.getenv("YC_USE_METADATA_TOKEN", "").lower() in {"1", "true", "yes"}
     if not instance_id:
         raise ValueError("YC_INSTANCE_ID is required")
-    if not iam_token and not oauth_token:
-        raise ValueError("set YC_IAM_TOKEN or YC_OAUTH_TOKEN")
+    if not iam_token and not oauth_token and not use_metadata_token:
+        raise ValueError("set YC_USE_METADATA_TOKEN=true, YC_IAM_TOKEN, or YC_OAUTH_TOKEN")
     return Settings(
         instance_id=instance_id,
         iam_token=iam_token,
         oauth_token=oauth_token,
+        use_metadata_token=use_metadata_token,
         interval_seconds=positive_int("CHECK_INTERVAL_SECONDS", 60),
         timeout_seconds=positive_int("REQUEST_TIMEOUT_SECONDS", 15),
     )
@@ -84,6 +88,17 @@ def api_request(url: str, token: str, timeout: int, method: str = "GET", payload
 def get_iam_token(settings: Settings) -> str:
     if settings.iam_token:
         return settings.iam_token
+    if settings.use_metadata_token:
+        request = Request(METADATA_TOKEN_API, headers={"Metadata-Flavor": "Google"})
+        try:
+            with urlopen(request, timeout=settings.timeout_seconds) as response:
+                metadata = json.load(response)
+        except (HTTPError, URLError) as exc:
+            raise RuntimeError(f"could not get token from VM metadata service: {exc}") from exc
+        token = metadata.get("access_token")
+        if not isinstance(token, str) or not token:
+            raise RuntimeError("metadata service response does not contain access_token")
+        return token
     assert settings.oauth_token
     response = api_request(IAM_API, settings.oauth_token, settings.timeout_seconds, method="POST", payload={})
     token = response.get("iamToken")
