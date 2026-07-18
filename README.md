@@ -39,34 +39,24 @@ python watchdog.py
 
 При состоянии `STOPPED` watchdog вызывает `start` и ждёт следующего цикла. При `RUNNING`, `STARTING` и переходных состояниях он ничего не делает. Ошибки API логируются, но не останавливают процесс.
 
-## Запуск как служба Linux (systemd)
+## Быстрая установка как службы Linux (systemd)
 
-Сохраните секреты в `/etc/yc-vm-watchdog.env` с правами `600`, затем создайте `/etc/systemd/system/yc-vm-watchdog.service`:
+Watchdog должен находиться **на другой постоянно работающей машине**: если запустить его на отслеживаемой VM, он остановится вместе с ней и не сможет её включить. Подойдёт отдельная недорогая VM, сервер или домашний Linux-компьютер.
 
-```ini
-[Unit]
-Description=Yandex Cloud VM watchdog
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=watchdog
-WorkingDirectory=/opt/yc-vm-watchdog
-EnvironmentFile=/etc/yc-vm-watchdog.env
-ExecStart=/usr/bin/python3 /opt/yc-vm-watchdog/watchdog.py
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Активируйте службу:
+На машине watchdog выполните:
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now yc-vm-watchdog
+git clone https://github.com/mokryi-hleb/yandex-auto-up.git
+cd yandex-auto-up
+sudo ./install.sh
+```
+
+Установщик запросит ID VM и токен скрытым вводом, скопирует приложение в `/opt/yc-vm-watchdog`, сохранит настройки в `/etc/yc-vm-watchdog.env` с правами `600` и включит службу. Для долгой работы предпочтителен OAuth-токен: скрипт сам получает из него свежие IAM-токены.
+
+Проверка и журналы:
+
+```bash
+sudo systemctl status yc-vm-watchdog
 sudo journalctl -u yc-vm-watchdog -f
 ```
 
