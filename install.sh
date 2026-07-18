@@ -38,28 +38,33 @@ while [[ -z "${INSTANCE_ID}" ]]; do
   read -r -p "VM ID cannot be empty. Enter VM ID: " INSTANCE_ID
 done
 
-echo "Use an OAuth token if possible: the program exchanges it for short-lived IAM tokens automatically."
-echo "Paste a token (input is hidden):"
-read -r -s TOKEN
-echo
-while [[ -z "${TOKEN}" ]]; do
-  echo "Token cannot be empty. Paste a token:"
-  read -r -s TOKEN
-  echo
-done
-
-read -r -p "Token type [oauth/IAM] (default: oauth): " TOKEN_TYPE
-TOKEN_TYPE="${TOKEN_TYPE:-oauth}"
+echo "Recommended: choose metadata when this watchdog runs on another Yandex Cloud VM with a service account attached."
+read -r -p "Authentication [metadata/IAM] (default: metadata): " TOKEN_TYPE
+TOKEN_TYPE="${TOKEN_TYPE:-metadata}"
 case "${TOKEN_TYPE,,}" in
+  metadata)
+    TOKEN_VARIABLE="YC_USE_METADATA_TOKEN"
+    TOKEN="true"
+    ;;
   oauth)
-    TOKEN_VARIABLE="YC_OAUTH_TOKEN"
+    echo "OAuth tokens from Yandex ID issued after 1 June 2026 are not supported by Yandex Cloud." >&2
+    exit 1
     ;;
   iam)
+    TOKEN_VARIABLE="YC_OAUTH_TOKEN"
     TOKEN_VARIABLE="YC_IAM_TOKEN"
+    echo "Paste an IAM token (input is hidden):"
+    read -r -s TOKEN
+    echo
+    while [[ -z "${TOKEN}" ]]; do
+      echo "Token cannot be empty. Paste an IAM token:"
+      read -r -s TOKEN
+      echo
+    done
     echo "Warning: IAM tokens expire. Re-run this installer or update ${ENV_FILE} when it expires." >&2
     ;;
   *)
-    echo "Unknown token type. Enter oauth or IAM." >&2
+    echo "Unknown authentication type. Enter metadata or IAM." >&2
     exit 1
     ;;
 esac
