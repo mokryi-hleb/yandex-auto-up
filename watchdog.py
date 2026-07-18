@@ -12,7 +12,10 @@ import os
 import signal
 import sys
 import time
+from base64 import urlsafe_b64encode
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -30,6 +33,7 @@ class Settings:
     iam_token: str | None
     oauth_token: str | None
     use_metadata_token: bool
+    service_account_key_file: Path | None
     interval_seconds: int
     timeout_seconds: int
 
@@ -50,30 +54,35 @@ def read_settings() -> Settings:
     iam_token = os.getenv("YC_IAM_TOKEN", "").strip() or None
     oauth_token = os.getenv("YC_OAUTH_TOKEN", "").strip() or None
     use_metadata_token = os.getenv("YC_USE_METADATA_TOKEN", "").lower() in {"1", "true", "yes"}
+    key_file_value = os.getenv("YC_SERVICE_ACCOUNT_KEY_FILE", "").strip()
+    service_account_key_file = Path(key_file_value) if key_file_value else None
     if not instance_id:
         raise ValueError("YC_INSTANCE_ID is required")
-    if not iam_token and not oauth_token and not use_metadata_token:
-        raise ValueError("set YC_USE_METADATA_TOKEN=true, YC_IAM_TOKEN, or YC_OAUTH_TOKEN")
+    if service_account_key_file and not service_account_key_file.is_file():
+        raise ValueError(f"service account key file does not exist: {service_account_key_file}")
+    if not iam_token and not oauth_token and not use_metadata_token and not service_account_key_file:
+        raise ValueError("set YC_SERVICE_ACCOUNT_KEY_FILE, YC_USE_METADATA_TOKEN=true, YC_IAM_TOKEN, or YC_OAUTH_TOKEN")
     return Settings(
         instance_id=instance_id,
         iam_token=iam_token,
         oauth_token=oauth_token,
         use_metadata_token=use_metadata_token,
+        service_account_key_file=service_account_key_file,
         interval_seconds=positive_int("CHECK_INTERVAL_SECONDS", 60),
         timeout_seconds=positive_int("REQUEST_TIMEOUT_SECONDS", 15),
     )
 
 
-def api_request(url: str, token: str, timeout: int, method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+def api_request(url: str, token: str | None, timeout: int, method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
     body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     request = Request(
         url,
         data=body,
         method=method,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
+        headers=headers,
     )
     try:
         with urlopen(request, timeout=timeout) as response:
@@ -85,20 +94,83 @@ def api_request(url: str, token: str, timeout: int, method: str = "GET", payload
         raise RuntimeError(f"network error: {exc.reason}") from exc
 
 
+TOKEN_CACHE: dict[str, tuple[str, float]] = {}
+
+
+def cache_token(cache_key: str, response: dict[str, Any]) -> str:
+    token = response.get("iamToken") or response.get("access_token")
+    if not isinstance(token, str) or not token:
+        raise RuntimeError("token response does not contain a token")
+    expires_at = response.get("expiresAt") or response.get("expires_at")
+    try:
+        expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00")).timestamp() - 60
+    except (AttributeError, ValueError):
+        expiry = time.time() + 3300
+    TOKEN_CACHE[cache_key] = (token, expiry)
+    return token
+
+
+def cached_token(cache_key: str) -> str | None:
+    token_data = TOKEN_CACHE.get(cache_key)
+    if token_data and token_data[1] > time.time():
+        return token_data[0]
+    return None
+
+
+def encode_segment(value: dict[str, Any]) -> str:
+    return urlsafe_b64encode(json.dumps(value, separators=(",", ":")).encode("utf-8")).rstrip(b"=").decode("ascii")
+
+
+def service_account_jwt(key_file: Path) -> str:
+    try:
+        key = json.loads(key_file.read_text(encoding="utf-8"))
+        key_id = key["id"]
+        service_account_id = key["service_account_id"]
+        private_key = key["private_key"].encode("utf-8")
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"could not read service account key: {exc}") from exc
+
+    issued_at = int(time.time())
+    header = encode_segment({"alg": "PS256", "typ": "JWT", "kid": key_id})
+    payload = encode_segment({"aud": IAM_API, "iss": service_account_id, "iat": issued_at, "exp": issued_at + 3600})
+    signed_data = f"{header}.{payload}".encode("ascii")
+    try:
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        signer = serialization.load_pem_private_key(private_key, password=None)
+        signature = signer.sign(
+            signed_data,
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
+            hashes.SHA256(),
+        )
+    except Exception as exc:
+        raise RuntimeError(f"could not sign service account JWT: {exc}") from exc
+    return f"{header}.{payload}.{urlsafe_b64encode(signature).rstrip(b'=').decode('ascii')}"
+
+
 def get_iam_token(settings: Settings) -> str:
     if settings.iam_token:
         return settings.iam_token
     if settings.use_metadata_token:
+        cached = cached_token("metadata")
+        if cached:
+            return cached
         request = Request(METADATA_TOKEN_API, headers={"Metadata-Flavor": "Google"})
         try:
             with urlopen(request, timeout=settings.timeout_seconds) as response:
                 metadata = json.load(response)
         except (HTTPError, URLError) as exc:
             raise RuntimeError(f"could not get token from VM metadata service: {exc}") from exc
-        token = metadata.get("access_token")
-        if not isinstance(token, str) or not token:
-            raise RuntimeError("metadata service response does not contain access_token")
-        return token
+        return cache_token("metadata", metadata)
+    if settings.service_account_key_file:
+        cache_key = str(settings.service_account_key_file)
+        cached = cached_token(cache_key)
+        if cached:
+            return cached
+        jwt = service_account_jwt(settings.service_account_key_file)
+        response = api_request(IAM_API, None, settings.timeout_seconds, method="POST", payload={"jwt": jwt})
+        return cache_token(cache_key, response)
     assert settings.oauth_token
     response = api_request(IAM_API, settings.oauth_token, settings.timeout_seconds, method="POST", payload={})
     token = response.get("iamToken")

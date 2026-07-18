@@ -1,3 +1,5 @@
 .env
+authorized_key.json
+authorized-key.json
 __pycache__/
 *.py[cod]
