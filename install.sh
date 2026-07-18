@@ -27,6 +27,11 @@ if ! python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 10))'; then
   exit 1
 fi
 
+if ! python3 -m venv --help >/dev/null 2>&1; then
+  echo "The Python venv module is required. On Debian/Ubuntu: sudo apt install python3-venv" >&2
+  exit 1
+fi
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 if [[ ! -f "${SCRIPT_DIR}/watchdog.py" ]]; then
   echo "watchdog.py was not found next to install.sh." >&2
@@ -38,10 +43,19 @@ while [[ -z "${INSTANCE_ID}" ]]; do
   read -r -p "VM ID cannot be empty. Enter VM ID: " INSTANCE_ID
 done
 
-echo "Recommended: choose metadata when this watchdog runs on another Yandex Cloud VM with a service account attached."
-read -r -p "Authentication [metadata/IAM] (default: metadata): " TOKEN_TYPE
-TOKEN_TYPE="${TOKEN_TYPE:-metadata}"
+echo "Recommended for an external Linux host: use a service-account authorized-key JSON file."
+read -r -p "Authentication [key/metadata/IAM] (default: key): " TOKEN_TYPE
+TOKEN_TYPE="${TOKEN_TYPE:-key}"
 case "${TOKEN_TYPE,,}" in
+  key)
+    read -r -p "Path to the service-account authorized-key JSON file: " KEY_FILE
+    if [[ ! -f "${KEY_FILE}" ]]; then
+      echo "Key file was not found: ${KEY_FILE}" >&2
+      exit 1
+    fi
+    TOKEN_VARIABLE="YC_SERVICE_ACCOUNT_KEY_FILE"
+    TOKEN="/etc/${SERVICE_NAME}-key.json"
+    ;;
   metadata)
     TOKEN_VARIABLE="YC_USE_METADATA_TOKEN"
     TOKEN="true"
@@ -51,7 +65,6 @@ case "${TOKEN_TYPE,,}" in
     exit 1
     ;;
   iam)
-    TOKEN_VARIABLE="YC_OAUTH_TOKEN"
     TOKEN_VARIABLE="YC_IAM_TOKEN"
     echo "Paste an IAM token (input is hidden):"
     read -r -s TOKEN
@@ -75,6 +88,13 @@ fi
 
 install -d -o root -g root -m 0755 "${INSTALL_DIR}"
 install -o root -g root -m 0755 "${SCRIPT_DIR}/watchdog.py" "${INSTALL_DIR}/watchdog.py"
+install -o root -g root -m 0644 "${SCRIPT_DIR}/requirements.txt" "${INSTALL_DIR}/requirements.txt"
+python3 -m venv "${INSTALL_DIR}/venv"
+"${INSTALL_DIR}/venv/bin/pip" install --disable-pip-version-check --requirement "${INSTALL_DIR}/requirements.txt"
+
+if [[ "${TOKEN_TYPE,,}" == "key" ]]; then
+  install -o "${SERVICE_NAME}" -g "${SERVICE_NAME}" -m 0400 "${KEY_FILE}" "/etc/${SERVICE_NAME}-key.json"
+fi
 
 umask 077
 cat > "${ENV_FILE}" <<EOF
@@ -99,7 +119,7 @@ Type=simple
 User=${SERVICE_NAME}
 WorkingDirectory=${INSTALL_DIR}
 EnvironmentFile=${ENV_FILE}
-ExecStart=/usr/bin/python3 ${INSTALL_DIR}/watchdog.py
+ExecStart=${INSTALL_DIR}/venv/bin/python ${INSTALL_DIR}/watchdog.py
 Restart=always
 RestartSec=10
 
